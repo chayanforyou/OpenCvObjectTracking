@@ -1,2 +1,0 @@
-ninja: Entering directory `/Users/jotno2sqh/Documents/AndroidStudioProjects/OpenCvObjectTracking/openCVLibrary412/.cxx/Debug/4z265d4q/arm64-v8a'
-ninja: no work to do.

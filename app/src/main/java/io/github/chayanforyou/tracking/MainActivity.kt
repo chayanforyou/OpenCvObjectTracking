@@ -19,13 +19,19 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Size
+import android.view.Gravity
 import android.view.MotionEvent
 import android.view.Surface
 import android.view.TextureView
+import android.widget.LinearLayout
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.floatingactionbutton.FloatingActionButton
 import org.opencv.android.OpenCVLoader
 import org.opencv.core.Core
 import org.opencv.core.Mat
@@ -40,15 +46,19 @@ import org.opencv.tracking.legacy_TrackerMIL
 import org.opencv.tracking.legacy_TrackerMOSSE
 import org.opencv.tracking.legacy_TrackerMedianFlow
 import org.opencv.tracking.legacy_TrackerTLD
+import java.util.Locale
 import kotlin.math.max
 import kotlin.math.min
 
 enum class Drawing { DRAWING, TRACKING, CLEAR }
 
+enum class Tracker { MEDIAN_FLOW, CSRT, KCF, MOSSE, TLD, MIL }
+
 class MainActivity : AppCompatActivity() {
 
     private lateinit var textureView: TextureView
     private lateinit var trackingOverlay: OverlayView
+    private lateinit var selectTracker: FloatingActionButton
 
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
@@ -62,14 +72,14 @@ class MainActivity : AppCompatActivity() {
     private var processing = false
     private var targetLocked = false
     private var handler = Handler(Looper.getMainLooper())
-    private var selectedTracker = "TrackerKCF"  // OpenCV tracking algorithm
+    private var selectedTracker = Tracker.MEDIAN_FLOW
 
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             if (granted) {
                 openCamera()
             } else {
-                Toast.makeText(this, "Sorry!!!, you can't use this app without granting permission", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "Sorry!!!, you can't use this app without camera permission", Toast.LENGTH_LONG).show()
             }
         }
 
@@ -91,7 +101,9 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
         textureView = findViewById(R.id.texture)
         trackingOverlay = findViewById(R.id.tracking_overlay)
+        selectTracker = findViewById(R.id.select_tracker)
         textureView.surfaceTextureListener = textureListener
+        selectTracker.setOnClickListener { selectTracker() }
     }
 
     override fun onDestroy() {
@@ -240,9 +252,16 @@ class MainActivity : AppCompatActivity() {
                     }
                     MotionEvent.ACTION_POINTER_DOWN -> {
                         targetLocked = !targetLocked
-                        Toast.makeText(this@MainActivity, "Target ${if (targetLocked) "LOCKED" else "UNLOCKED"}", Toast.LENGTH_SHORT).show()
                         drawing = Drawing.DRAWING
                         trackingOverlay.invalidate()
+
+                        if (targetLocked) {
+                            selectTracker.hide()
+                            Toast.makeText(this@MainActivity, "Target LOCKED", Toast.LENGTH_SHORT).show()
+                        } else {
+                            selectTracker.show()
+                            Toast.makeText(this@MainActivity, "Target UNLOCKED", Toast.LENGTH_SHORT).show()
+                        }
                     }
                 }
                 true
@@ -289,13 +308,12 @@ class MainActivity : AppCompatActivity() {
                 val imageGrabInit = Mat().also { imageGrab?.copyTo(it) }
 
                 tracker = when (selectedTracker) {
-                    "TrackerMedianFlow" -> legacy_TrackerMedianFlow.create()
-                    "TrackerCSRT" -> legacy_TrackerCSRT.create()
-                    "TrackerKCF" -> legacy_TrackerKCF.create()
-                    "TrackerMOSSE" -> legacy_TrackerMOSSE.create()
-                    "TrackerTLD" -> legacy_TrackerTLD.create()
-                    "TrackerMIL" -> legacy_TrackerMIL.create()
-                    else -> legacy_TrackerMedianFlow.create()
+                    Tracker.MEDIAN_FLOW -> legacy_TrackerMedianFlow.create()
+                    Tracker.CSRT -> legacy_TrackerCSRT.create()
+                    Tracker.KCF -> legacy_TrackerKCF.create()
+                    Tracker.MOSSE -> legacy_TrackerMOSSE.create()
+                    Tracker.TLD -> legacy_TrackerTLD.create()
+                    Tracker.MIL -> legacy_TrackerMIL.create()
                 }
                 tracker!!.init(imageGrabInit, initRectangle)
                 drawing = Drawing.TRACKING
@@ -313,5 +331,56 @@ class MainActivity : AppCompatActivity() {
             tracker = null
         }
         processing = false
+    }
+
+    private fun selectTracker() {
+        val builder = MaterialAlertDialogBuilder(this)
+        builder.setTitle("Tracker Selection")
+
+        val trackerMap = mapOf(
+            Tracker.MEDIAN_FLOW to "TrackerMedianFlow (Fast)",
+            Tracker.CSRT to "TrackerCSRT (High Accuracy)",
+            Tracker.KCF to "TrackerKCF (Fast & Accurate)",
+            Tracker.MOSSE to "TrackerMOSSE (Ultra Fast)",
+            Tracker.TLD to "TrackerTLD (Long-term)",
+            Tracker.MIL to "TrackerMIL (Reliable)"
+        )
+
+        val radioButtons = Array(trackerMap.size) { RadioButton(this) }
+        val radioGroup = RadioGroup(this).apply {
+            orientation = RadioGroup.VERTICAL
+        }
+
+        trackerMap.entries.forEachIndexed { index, (tracker, name) ->
+            radioButtons[index].also { rb ->
+                rb.id = index + 100
+                rb.text = String.format(Locale.getDefault(), "%s", name)
+                rb.isChecked = (tracker == selectedTracker)
+                radioGroup.addView(rb)
+            }
+        }
+
+        radioGroup.setOnCheckedChangeListener { _, checkedId ->
+            val radioButton = radioGroup.findViewById<RadioButton>(checkedId)
+            if (radioButton?.isChecked == true) {
+                val tracker = trackerMap.entries.find {
+                    it.value == radioButton.text.toString().trim()
+                }?.key
+                if (tracker != null) selectedTracker = tracker
+            }
+        }
+
+        val layout = LinearLayout(this).apply {
+            setPadding(60, 40, 0, 0)
+            gravity = Gravity.FILL_HORIZONTAL
+            addView(radioGroup)
+        }
+
+        builder.setView(layout)
+        builder.setPositiveButton("OK") { dialog, _ ->
+            dialog.dismiss()
+        }
+        builder.setCancelable(false)
+        builder.show()
     }
 }
