@@ -17,7 +17,7 @@ import android.hardware.camera2.CaptureRequest
 import android.media.ImageReader
 import android.os.Bundle
 import android.os.Handler
-import android.os.Looper
+import android.os.HandlerThread
 import android.util.Size
 import android.view.Gravity
 import android.view.MotionEvent
@@ -47,12 +47,8 @@ import org.opencv.tracking.legacy_TrackerMOSSE
 import org.opencv.tracking.legacy_TrackerMedianFlow
 import org.opencv.tracking.legacy_TrackerTLD
 import java.util.Locale
-import kotlin.math.max
-import kotlin.math.min
-
-enum class Drawing { DRAWING, TRACKING, CLEAR }
-
-enum class Tracker { MEDIAN_FLOW, CSRT, KCF, MOSSE, TLD, MIL }
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
 
 class MainActivity : AppCompatActivity() {
 
@@ -63,23 +59,31 @@ class MainActivity : AppCompatActivity() {
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
     private var previewRequestBuilder: CaptureRequest.Builder? = null
+    private var backgroundHandler: Handler? = null
+    private var backgroundThread: HandlerThread? = null
+    private val cameraLock = ReentrantLock()
     private var imageGrab: Mat? = null
     private var imageReader: ImageReader? = null
     private var tracker: legacy_Tracker? = null
     private var drawing = Drawing.DRAWING
+    private var selectedTracker = TrackerType.MEDIAN_FLOW
     private val camResolution = Size(1280, 720)
     private val points = arrayOf(Point(0, 0), Point(0, 0))
-    private var processing = false
-    private var targetLocked = false
-    private var handler = Handler(Looper.getMainLooper())
-    private var selectedTracker = Tracker.MEDIAN_FLOW
+    private var isProcessing = false
+    private var isTargetLocked = false
+
+    private enum class Drawing {
+        DRAWING, TRACKING, CLEAR
+    }
+
+    private enum class TrackerType {
+        MEDIAN_FLOW, CSRT, KCF, MOSSE, TLD, MIL
+    }
 
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            if (granted) {
-                openCamera()
-            } else {
-                Toast.makeText(this, "Sorry!!!, you can't use this app without camera permission", Toast.LENGTH_LONG).show()
+            if (!granted) {
+                Toast.makeText(this, "Sorry!!!, you can't use this app without granting permission", Toast.LENGTH_LONG).show()
             }
         }
 
@@ -106,9 +110,42 @@ class MainActivity : AppCompatActivity() {
         selectTracker.setOnClickListener { selectTracker() }
     }
 
-    override fun onDestroy() {
+    override fun onResume() {
+        super.onResume()
+        startBackgroundThread()
+        if (textureView.isAvailable) {
+            openCamera()
+        }
+    }
+
+    override fun onPause() {
         closeCamera()
+        stopBackgroundThread()
+        super.onPause()
+    }
+
+    override fun onDestroy() {
+        imageGrab?.release()
+        imageGrab = null
+        tracker?.clear()
+        tracker = null
         super.onDestroy()
+    }
+
+    private fun startBackgroundThread() {
+        backgroundThread = HandlerThread("obj-tracking-thread").apply { start() }
+        backgroundHandler = Handler(backgroundThread!!.looper)
+    }
+
+    private fun stopBackgroundThread() {
+        backgroundThread?.quitSafely()
+        try {
+            backgroundThread?.join()
+            backgroundThread = null
+            backgroundHandler = null
+        } catch (e: InterruptedException) {
+            e.printStackTrace()
+        }
     }
 
     private fun openCamera() {
@@ -120,6 +157,9 @@ class MainActivity : AppCompatActivity() {
         val manager = getSystemService(CAMERA_SERVICE) as CameraManager
         try {
             val cameraId = manager.cameraIdList.first()
+            if (!cameraLock.tryLock(2500, TimeUnit.MILLISECONDS)) {
+                throw RuntimeException("Timeout waiting to lock camera")
+            }
             manager.openCamera(cameraId, stateCallback, null)
         } catch (e: CameraAccessException) {
             e.printStackTrace()
@@ -127,25 +167,33 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun closeCamera() {
-        captureSession?.close()
-        captureSession = null
-        cameraDevice?.close()
-        cameraDevice = null
-        imageReader?.close()
-        imageReader = null
+        cameraLock.lock()
+        try {
+            captureSession?.close()
+            captureSession = null
+            cameraDevice?.close()
+            cameraDevice = null
+            imageReader?.close()
+            imageReader = null
+        } finally {
+            cameraLock.unlock()
+        }
     }
 
     private val stateCallback = object : CameraDevice.StateCallback() {
         override fun onOpened(camera: CameraDevice) {
+            cameraLock.unlock()
             cameraDevice = camera
             createCameraPreview()
         }
 
         override fun onDisconnected(camera: CameraDevice) {
+            cameraLock.unlock()
             cameraDevice?.close()
         }
 
         override fun onError(camera: CameraDevice, error: Int) {
+            cameraLock.unlock()
             cameraDevice?.close()
             cameraDevice = null
         }
@@ -161,7 +209,7 @@ class MainActivity : AppCompatActivity() {
                 addTarget(surface)
             }
             imageReader = ImageReader.newInstance(camResolution.width, camResolution.height, ImageFormat.JPEG, 2).apply {
-                setOnImageAvailableListener(onImageAvailableListener, handler)
+                setOnImageAvailableListener(onImageAvailableListener, backgroundHandler)
             }
             previewRequestBuilder?.addTarget(imageReader!!.surface)
             cameraDevice?.createCaptureSession(
@@ -182,7 +230,7 @@ class MainActivity : AppCompatActivity() {
                             session.setRepeatingRequest(
                                 previewRequestBuilder!!.build(),
                                 null,
-                                handler
+                                backgroundHandler
                             )
                         } catch (e: CameraAccessException) {
                             e.printStackTrace()
@@ -214,17 +262,13 @@ class MainActivity : AppCompatActivity() {
                         if (drawing == Drawing.TRACKING) {
                             paint.color = Color.GREEN
                             canvas.drawLine(
-                                (points[0].x + points[1].x) / 2f,
-                                0f,
-                                (points[0].x + points[1].x) / 2f,
-                                trackingOverlay.height.toFloat(),
+                                (points[0].x + points[1].x) / 2f, 0f,
+                                (points[0].x + points[1].x) / 2f, trackingOverlay.height.toFloat(),
                                 paint
                             )
                             canvas.drawLine(
-                                0f,
-                                (points[0].y + points[1].y) / 2f,
-                                trackingOverlay.width.toFloat(),
-                                (points[0].y + points[1].y) / 2f,
+                                0f, (points[0].y + points[1].y) / 2f,
+                                trackingOverlay.width.toFloat(), (points[0].y + points[1].y) / 2f,
                                 paint
                             )
                         }
@@ -236,26 +280,26 @@ class MainActivity : AppCompatActivity() {
                 val x = event.x.toInt()
                 val y = event.y.toInt()
                 when (event.action and MotionEvent.ACTION_MASK) {
-                    MotionEvent.ACTION_DOWN -> if (!targetLocked) {
+                    MotionEvent.ACTION_DOWN -> if (!isTargetLocked) {
                         drawing = Drawing.DRAWING
                         points[0].set(x, y)
                         points[1].set(x, y)
                         trackingOverlay.invalidate()
                     }
-                    MotionEvent.ACTION_MOVE -> if (!targetLocked) {
+                    MotionEvent.ACTION_MOVE -> if (!isTargetLocked) {
                         points[1].set(x, y)
                         trackingOverlay.invalidate()
                     }
-                    MotionEvent.ACTION_UP -> if (!targetLocked) {
+                    MotionEvent.ACTION_UP -> if (!isTargetLocked) {
                         drawing = Drawing.CLEAR
                         trackingOverlay.invalidate()
                     }
                     MotionEvent.ACTION_POINTER_DOWN -> {
-                        targetLocked = !targetLocked
+                        isTargetLocked = !isTargetLocked
                         drawing = Drawing.DRAWING
                         trackingOverlay.invalidate()
 
-                        if (targetLocked) {
+                        if (isTargetLocked) {
                             selectTracker.hide()
                             Toast.makeText(this@MainActivity, "Target LOCKED", Toast.LENGTH_SHORT).show()
                         } else {
@@ -273,64 +317,66 @@ class MainActivity : AppCompatActivity() {
 
     private val onImageAvailableListener = ImageReader.OnImageAvailableListener { reader ->
         val image = reader.acquireLatestImage() ?: return@OnImageAvailableListener
-        if (processing) {
+        if (isProcessing) {
             image.close()
             return@OnImageAvailableListener
         }
-        processing = true
+        isProcessing = true
 
-        if (targetLocked) {
-            val bb = image.planes[0].buffer
-            val data = ByteArray(bb.remaining()).also { bb.get(it) }
-            imageGrab = Imgcodecs.imdecode(MatOfByte(*data), Imgcodecs.IMREAD_UNCHANGED)
-            Core.transpose(imageGrab, imageGrab)
-            Core.flip(imageGrab, imageGrab, 1)
-            Imgproc.resize(imageGrab, imageGrab, org.opencv.core.Size(240.0, 320.0))
+        try {
+            if (isTargetLocked) {
+                val buffer = image.planes[0].buffer
+                val data = ByteArray(buffer.remaining()).also { buffer.get(it) }
+                imageGrab?.release()
+                imageGrab = Imgcodecs.imdecode(MatOfByte(*data), Imgcodecs.IMREAD_UNCHANGED).apply {
+                    Core.transpose(this, this)
+                    Core.flip(this, this, 1)
+                    Imgproc.resize(this, this, org.opencv.core.Size(240.0, 320.0))
+                }
+            }
+            processFrame()
+        } finally {
+            image.close()
+            isProcessing = false
         }
-        image.close()
-        processing()
     }
 
-    private fun processing() {
-        if (targetLocked && imageGrab != null) {
+    private fun processFrame() {
+        if (isTargetLocked && imageGrab != null) {
             if (drawing == Drawing.DRAWING) {
-                val minX = (min(points[0].x.toFloat(), points[1].x.toFloat()) / trackingOverlay.width * imageGrab!!.cols()).toInt()
-                val minY = (min(points[0].y.toFloat(), points[1].y.toFloat())/ trackingOverlay.height * imageGrab!!.rows()).toInt()
-                val maxX = (max(points[0].x.toFloat(), points[1].x.toFloat())/ trackingOverlay.width * imageGrab!!.cols()).toInt()
-                val maxY = (max(points[0].y.toFloat(), points[1].y.toFloat()) / trackingOverlay.height * imageGrab!!.rows()).toInt()
+                val minX = (minOf(points[0].x.toFloat(), points[1].x.toFloat()) / trackingOverlay.width * imageGrab!!.cols()).toInt()
+                val minY = (minOf(points[0].y.toFloat(), points[1].y.toFloat()) / trackingOverlay.height * imageGrab!!.rows()).toInt()
+                val maxX = (maxOf(points[0].x.toFloat(), points[1].x.toFloat()) / trackingOverlay.width * imageGrab!!.cols()).toInt()
+                val maxY = (maxOf(points[0].y.toFloat(), points[1].y.toFloat()) / trackingOverlay.height * imageGrab!!.rows()).toInt()
 
-                val initRectangle = Rect2d(
-                    minX.toDouble(),
-                    minY.toDouble(),
-                    (maxX - minX).toDouble(),
-                    (maxY - minY).toDouble()
-                )
-                val imageGrabInit = Mat().also { imageGrab?.copyTo(it) }
-
+                val initRectangle = Rect2d(minX.toDouble(), minY.toDouble(), (maxX - minX).toDouble(), (maxY - minY).toDouble())
                 tracker = when (selectedTracker) {
-                    Tracker.MEDIAN_FLOW -> legacy_TrackerMedianFlow.create()
-                    Tracker.CSRT -> legacy_TrackerCSRT.create()
-                    Tracker.KCF -> legacy_TrackerKCF.create()
-                    Tracker.MOSSE -> legacy_TrackerMOSSE.create()
-                    Tracker.TLD -> legacy_TrackerTLD.create()
-                    Tracker.MIL -> legacy_TrackerMIL.create()
+                    TrackerType.MEDIAN_FLOW -> legacy_TrackerMedianFlow.create()
+                    TrackerType.CSRT -> legacy_TrackerCSRT.create()
+                    TrackerType.KCF -> legacy_TrackerKCF.create()
+                    TrackerType.MOSSE -> legacy_TrackerMOSSE.create()
+                    TrackerType.TLD -> legacy_TrackerTLD.create()
+                    TrackerType.MIL -> legacy_TrackerMIL.create()
+                }.apply {
+                    init(imageGrab!!, initRectangle)
                 }
-                tracker!!.init(imageGrabInit, initRectangle)
                 drawing = Drawing.TRACKING
             } else {
-                val trackingRectangle = Rect2d(0.0, 0.0, 1.0, 1.0)
-                tracker?.update(imageGrab!!, trackingRectangle)
-                points[0].x = (trackingRectangle.x * trackingOverlay.width / imageGrab!!.cols()).toInt()
-                points[0].y = (trackingRectangle.y * trackingOverlay.height / imageGrab!!.rows()).toInt()
-                points[1].x = points[0].x + (trackingRectangle.width * trackingOverlay.width / imageGrab!!.cols()).toInt()
-                points[1].y = points[0].y + (trackingRectangle.height * trackingOverlay.height / imageGrab!!.rows()).toInt()
-                trackingOverlay.invalidate()
+                val trackingRectangle = Rect2d()
+                tracker?.update(imageGrab!!, trackingRectangle)?.let { success ->
+                    if (success) {
+                        points[0].x = (trackingRectangle.x * trackingOverlay.width / imageGrab!!.cols()).toInt()
+                        points[0].y = (trackingRectangle.y * trackingOverlay.height / imageGrab!!.rows()).toInt()
+                        points[1].x = points[0].x + (trackingRectangle.width * trackingOverlay.width / imageGrab!!.cols()).toInt()
+                        points[1].y = points[0].y + (trackingRectangle.height * trackingOverlay.height / imageGrab!!.rows()).toInt()
+                        trackingOverlay.invalidate()
+                    }
+                }
             }
         } else {
             tracker?.clear()
             tracker = null
         }
-        processing = false
     }
 
     private fun selectTracker() {
@@ -338,12 +384,12 @@ class MainActivity : AppCompatActivity() {
         builder.setTitle("Tracker Selection")
 
         val trackerMap = mapOf(
-            Tracker.MEDIAN_FLOW to "TrackerMedianFlow (Fast)",
-            Tracker.CSRT to "TrackerCSRT (High Accuracy)",
-            Tracker.KCF to "TrackerKCF (Fast & Accurate)",
-            Tracker.MOSSE to "TrackerMOSSE (Ultra Fast)",
-            Tracker.TLD to "TrackerTLD (Long-term)",
-            Tracker.MIL to "TrackerMIL (Reliable)"
+            TrackerType.MEDIAN_FLOW to "TrackerMedianFlow (Fast)",
+            TrackerType.CSRT to "TrackerCSRT (High Accuracy)",
+            TrackerType.KCF to "TrackerKCF (Fast & Accurate)",
+            TrackerType.MOSSE to "TrackerMOSSE (Ultra Fast)",
+            TrackerType.TLD to "TrackerTLD (Long-term)",
+            TrackerType.MIL to "TrackerMIL (Reliable)"
         )
 
         val radioButtons = Array(trackerMap.size) { RadioButton(this) }
